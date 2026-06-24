@@ -25,6 +25,8 @@ const GITHUB_RATE_LIMIT_COOLDOWN_MS = Number(process.env.GITHUB_RATE_LIMIT_COOLD
 const GITHUB_ERROR_COOLDOWN_MS = Number(process.env.GITHUB_ERROR_COOLDOWN_MS || 2 * 60 * 1000);
 const MAX_DATES_PER_FLUSH = Number(process.env.MAX_DATES_PER_FLUSH || 3);
 const STATS_CACHE_MS = Number(process.env.STATS_CACHE_MS || 60 * 1000);
+const GITHUB_WRITE_RETRY = Number(process.env.GITHUB_WRITE_RETRY || 3);
+const SERVER_TIMEZONE = 'Asia/Shanghai';
 
 const events = [];
 const liveCounters = new Map();   // date -> counter file shape, used for immediate dashboard display.
@@ -50,13 +52,57 @@ function nowIso() {
 function beijingDayKey(dateLike) {
   const d = dateLike ? new Date(dateLike) : new Date();
   if (Number.isNaN(d.getTime())) return beijingDayKey(new Date());
-  return d.toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+  return d.toLocaleDateString('en-CA', { timeZone: SERVER_TIMEZONE });
+}
+
+function isDayKey(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '').trim());
+}
+
+function compareDayKey(a, b) {
+  return String(a || '').localeCompare(String(b || ''));
+}
+
+function beijingEndOfDayIso(dayKey) {
+  if (!isDayKey(dayKey)) return nowIso();
+  const [y, m, d] = dayKey.split('-').map(Number);
+  // Beijing 23:59:59.999 = UTC next-day 15:59:59.999.
+  return new Date(Date.UTC(y, m - 1, d + 1, 15, 59, 59, 999)).toISOString();
+}
+
+function normalizeReportDate(raw, receivedAtIso = nowIso()) {
+  // 服务端以北京时间为准：客户端日期只作为“非未来日期”的补报提示。
+  // 如果客户端传来未来日期，一律压回服务端当前北京时间日期，避免提前生成明天数据。
+  const serverToday = beijingDayKey(receivedAtIso);
+  const value = String(raw || '').trim();
+  if (!isDayKey(value)) return serverToday;
+  if (compareDayKey(value, serverToday) > 0) return serverToday;
+  return value;
 }
 
 function normalizeDate(raw) {
   const value = String(raw || '').trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  if (isDayKey(value)) return value;
   return beijingDayKey();
+}
+
+function serverLastSeenAtForDate(receivedAtIso, reportDate) {
+  const receivedDay = beijingDayKey(receivedAtIso);
+  if (compareDayKey(receivedDay, reportDate) > 0) return beijingEndOfDayIso(reportDate);
+  return receivedAtIso;
+}
+
+function formatBeijingTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return String(iso || '');
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: SERVER_TIMEZONE,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  }).formatToParts(d).reduce((acc, p) => (acc[p.type] = p.value, acc), {});
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
 function monthInfo(date) {
@@ -166,7 +212,10 @@ async function ghGetJson(path) {
   if (!res.ok) {
     setGithubCooldownFromResponse(res, text);
     const info = parseGithubErrorBody(text);
-    throw new Error(`GitHub GET ${path} failed: ${res.status} ${info.message || text}`);
+    const err = new Error(`GitHub GET ${path} failed: ${res.status} ${info.message || text}`);
+    err.status = res.status;
+    err.githubBody = info;
+    throw err;
   }
   const info = JSON.parse(text);
   const content = b64DecodeUtf8(info.content || '');
@@ -185,7 +234,10 @@ async function ghPutJson(path, data, sha, message) {
   if (!res.ok) {
     setGithubCooldownFromResponse(res, text);
     const info = parseGithubErrorBody(text);
-    throw new Error(`GitHub PUT ${path} failed: ${res.status} ${info.message || text}`);
+    const err = new Error(`GitHub PUT ${path} failed: ${res.status} ${info.message || text}`);
+    err.status = res.status;
+    err.githubBody = info;
+    throw err;
   }
   return JSON.parse(text || '{}');
 }
@@ -256,6 +308,7 @@ function mergeDeviceCounter(targetCounter, weiboNickname, deviceHash, counter) {
     danmuSkipped: Math.max(count(old.danmuSkipped, 0), count(counter.danmuSkipped, 0)),
     lastSeenAt: counter.lastSeenAt || old.lastSeenAt || nowIso(),
     appVersion: counter.appVersion || old.appVersion || '',
+    clientTimestamp: counter.clientTimestamp || old.clientTimestamp || '',
   };
   computeUserTotals(user);
   targetCounter.users[weiboNickname] = user;
@@ -276,6 +329,7 @@ function mergeCounterFile(target, source) {
         danmuSkipped: device.danmuSkipped,
         lastSeenAt: device.lastSeenAt,
         appVersion: device.appVersion,
+        clientTimestamp: device.clientTimestamp,
       });
     }
   }
@@ -306,6 +360,7 @@ function summarizeCounter(counter) {
 }
 
 function acceptDailyCounters(body) {
+  const receivedAt = nowIso();
   const deviceHash = hashDeviceId(body.deviceId);
   const weiboNickname = normalizeNickname(body.weiboNickname || body.weiboUid || getProp(body, 'weiboNickname'));
   const rawCounters = Array.isArray(body.counters) ? body.counters : [{
@@ -320,14 +375,17 @@ function acceptDailyCounters(body) {
 
   const acceptedDates = [];
   for (const raw of rawCounters) {
-    const date = normalizeDate(raw.date || body.date);
+    const rawDate = raw.date || body.date;
+    const date = normalizeReportDate(rawDate, receivedAt);
     const item = {
       danmuSent: firstCount(raw, ['danmuSentToday', 'danmuSent'], 0),
       discussionSent: firstCount(raw, ['discussionSentToday', 'discussionSent'], 0),
       danmuFailed: firstCount(raw, ['danmuFailedToday', 'danmuFailed'], 0),
       discussionFailed: firstCount(raw, ['discussionFailedToday', 'discussionFailed'], 0),
       danmuSkipped: firstCount(raw, ['danmuSkippedToday', 'danmuSkipped'], 0),
-      lastSeenAt: raw.lastEventAt || body.timestamp || nowIso(),
+      // lastSeenAt 统一使用 Render 服务端接收时间，并按北京时间日期截断，避免客户端时钟导致未来日期/未来时间。
+      lastSeenAt: serverLastSeenAtForDate(receivedAt, date),
+      clientTimestamp: raw.lastEventAt || body.timestamp || '',
       appVersion: body.version || body.appVersion || '',
     };
     mergeDeviceCounter(ensureCounter(liveCounters, date), weiboNickname, deviceHash, item);
@@ -335,7 +393,33 @@ function acceptDailyCounters(body) {
     statsCache.delete(date);
     acceptedDates.push(date);
   }
-  return acceptedDates;
+  return [...new Set(acceptedDates)];
+}
+
+async function updateGithubJsonWithRetry(path, makeDefault, applyUpdate, message) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= Math.max(1, GITHUB_WRITE_RETRY); attempt++) {
+    const current = await ghGetJson(path);
+    const data = current.data || makeDefault();
+    const nextData = applyUpdate(data) || data;
+    try {
+      await ghPutJson(path, nextData, current.sha, message);
+      return nextData;
+    } catch (err) {
+      lastErr = err;
+      // GitHub Contents API 用 sha 做并发保护。409 表示文件已被其他写入更新，重新 GET 最新 sha 后 merge 重试。
+      if (err.status === 409 || /\b409\b/.test(err.message || '')) {
+        await sleep(350 * attempt);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr || new Error(`GitHub update failed for ${path}`);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function writeDateToGithub(date, pendingData) {
@@ -343,20 +427,30 @@ async function writeDateToGithub(date, pendingData) {
   const counterPath = `archive/counters/${year}/${month}/${date}.json`;
   const summaryPath = `archive/summary/${year}/${monthKey}.json`;
 
-  const current = await ghGetJson(counterPath);
-  const counterData = current.data || emptyCounterFile(date);
-  counterData.date = date;
-  mergeCounterFile(counterData, pendingData);
-  counterData.updatedAt = nowIso();
-  await ghPutJson(counterPath, counterData, current.sha, `biupc counter ${date}`);
+  const counterData = await updateGithubJsonWithRetry(
+    counterPath,
+    () => emptyCounterFile(date),
+    data => {
+      data.date = date;
+      mergeCounterFile(data, pendingData);
+      data.updatedAt = nowIso();
+      return data;
+    },
+    `biupc counter ${date}`
+  );
 
-  const summaryCurrent = await ghGetJson(summaryPath);
-  const summary = summaryCurrent.data || { month: monthKey, days: {} };
-  summary.month = monthKey;
-  summary.days = summary.days || {};
-  summary.days[date] = summarizeCounter(counterData);
-  summary.updatedAt = nowIso();
-  await ghPutJson(summaryPath, summary, summaryCurrent.sha, `biupc summary ${monthKey}`);
+  await updateGithubJsonWithRetry(
+    summaryPath,
+    () => ({ month: monthKey, days: {} }),
+    summary => {
+      summary.month = monthKey;
+      summary.days = summary.days || {};
+      summary.days[date] = summarizeCounter(counterData);
+      summary.updatedAt = nowIso();
+      return summary;
+    },
+    `biupc summary ${monthKey}`
+  );
 
   statsCache.delete(date);
 }
@@ -422,7 +516,8 @@ function pushMemoryEvent(body) {
     taskName: String(getProp(body, 'taskName', '') || ''),
     platform: normalizePlatform(getProp(body, 'platform', '') || ''),
     appVersion: String(body.version || body.appVersion || ''),
-    timestamp: body.timestamp || nowIso(),
+    timestamp: nowIso(),
+    clientTimestamp: body.timestamp || '',
   };
   events.push(item);
   while (events.length > MAX_EVENTS) events.shift();
@@ -479,15 +574,17 @@ function esc(s) {
 }
 
 function renderDashboard(stats) {
-  const rows = (stats.users || []).map((u, i) => `<tr><td>${i + 1}</td><td>${esc(u.weiboNickname)}</td><td>${u.activeDevices || 0}</td><td>${u.danmuSent || 0}</td><td>${u.discussionSent || 0}</td><td><b>${u.totalSent || 0}</b></td><td>${esc(u.lastSeenAt || '')}</td></tr>`).join('');
+  const rows = (stats.users || []).map((u, i) => `<tr><td>${i + 1}</td><td>${esc(u.weiboNickname)}</td><td>${u.activeDevices || 0}</td><td>${u.danmuSent || 0}</td><td>${u.discussionSent || 0}</td><td><b>${u.totalSent || 0}</b></td><td>${esc(formatBeijingTime(u.lastSeenAt) || '')}</td></tr>`).join('');
   const githubLine = `GitHub：${stats.githubEnabled ? '已启用' : '未启用/内存模式'}　状态：${esc(lastGithubStatus)}${githubInCooldown() ? `　冷却至：${esc(new Date(githubCooldownUntil).toISOString())}` : ''}`;
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>biupc dashboard</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f6f7fb;color:#111827}.wrap{max-width:1120px;margin:0 auto;padding:24px}h1{font-size:24px;margin:0 0 6px}.muted{color:#6b7280;font-size:13px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:20px 0}.card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px}.num{font-size:28px;font-weight:800;margin-top:8px}table{width:100%;border-collapse:collapse;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e5e7eb}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #eef0f4;font-size:14px}th{background:#f9fafb;color:#374151}tr:last-child td{border-bottom:0}.warn{margin-top:12px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:10px 12px;font-size:13px;word-break:break-all}@media(max-width:760px){.cards{grid-template-columns:1fr 1fr}.wrap{padding:14px}table{font-size:12px}}</style></head><body><div class="wrap"><h1>biupc 统计面板</h1><div class="muted">日期：${esc(stats.date)}　来源：${esc(stats.source)}　${githubLine}</div>${lastGithubError ? `<div class="warn">最近 GitHub 错误：${esc(lastGithubError)}</div>` : ''}<div class="cards"><div class="card"><div>今日活跃用户</div><div class="num">${stats.activeUsers || 0}</div></div><div class="card"><div>今日活跃设备</div><div class="num">${stats.activeDevices || 0}</div></div><div class="card"><div>弹幕发送</div><div class="num">${stats.danmuSent || 0}</div></div><div class="card"><div>讨论发送</div><div class="num">${stats.discussionSent || 0}</div></div></div><table><thead><tr><th>#</th><th>微博昵称</th><th>设备数</th><th>弹幕发送</th><th>讨论发送</th><th>总发送</th><th>最后上报</th></tr></thead><tbody>${rows || '<tr><td colspan="7" class="muted">暂无数据</td></tr>'}</tbody></table></div></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>biupc dashboard</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f6f7fb;color:#111827}.wrap{max-width:1120px;margin:0 auto;padding:24px}h1{font-size:24px;margin:0 0 6px}.muted{color:#6b7280;font-size:13px}.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:20px 0}.card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;padding:16px}.num{font-size:28px;font-weight:800;margin-top:8px}table{width:100%;border-collapse:collapse;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e5e7eb}th,td{text-align:left;padding:10px 12px;border-bottom:1px solid #eef0f4;font-size:14px}th{background:#f9fafb;color:#374151}tr:last-child td{border-bottom:0}.warn{margin-top:12px;color:#9a3412;background:#fff7ed;border:1px solid #fed7aa;border-radius:12px;padding:10px 12px;font-size:13px;word-break:break-all}@media(max-width:760px){.cards{grid-template-columns:1fr 1fr}.wrap{padding:14px}table{font-size:12px}}</style></head><body><div class="wrap"><h1>biupc 统计面板</h1><div class="muted">日期：${esc(stats.date)}（北京时间）　来源：${esc(stats.source)}　${githubLine}</div>${lastGithubError ? `<div class="warn">最近 GitHub 错误：${esc(lastGithubError)}</div>` : ''}<div class="cards"><div class="card"><div>今日活跃用户</div><div class="num">${stats.activeUsers || 0}</div></div><div class="card"><div>今日活跃设备</div><div class="num">${stats.activeDevices || 0}</div></div><div class="card"><div>弹幕发送</div><div class="num">${stats.danmuSent || 0}</div></div><div class="card"><div>讨论发送</div><div class="num">${stats.discussionSent || 0}</div></div></div><table><thead><tr><th>#</th><th>微博昵称</th><th>设备数</th><th>弹幕发送</th><th>讨论发送</th><th>总发送</th><th>最后上报</th></tr></thead><tbody>${rows || '<tr><td colspan="7" class="muted">暂无数据</td></tr>'}</tbody></table></div></body></html>`;
 }
 
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'biupc_monitor',
+    timezone: SERVER_TIMEZONE,
+    serverBeijingDate: beijingDayKey(),
     githubEnabled: githubEnabled(),
     owner: GITHUB_OWNER,
     repo: GITHUB_REPO,
@@ -515,6 +612,7 @@ app.post('/api/ping', async (req, res) => {
       ok: true,
       accepted: true,
       githubEnabled: githubEnabled(),
+      serverBeijingDate: beijingDayKey(),
       githubSaved: false,
       githubStatus: lastGithubStatus,
       pendingDates: pendingCounters.size,
