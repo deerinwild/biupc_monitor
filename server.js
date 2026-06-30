@@ -26,6 +26,8 @@ const GITHUB_ERROR_COOLDOWN_MS = Number(process.env.GITHUB_ERROR_COOLDOWN_MS || 
 const MAX_DATES_PER_FLUSH = Number(process.env.MAX_DATES_PER_FLUSH || 3);
 const STATS_CACHE_MS = Number(process.env.STATS_CACHE_MS || 60 * 1000);
 const GITHUB_WRITE_RETRY = Number(process.env.GITHUB_WRITE_RETRY || 3);
+const LATEST_INDEX_PATH = process.env.LATEST_INDEX_PATH || 'latest.json';
+const LATEST_INDEX_MAX_DAYS = Number(process.env.LATEST_INDEX_MAX_DAYS || 60);
 const SERVER_TIMEZONE = 'Asia/Shanghai';
 
 const events = [];
@@ -439,7 +441,7 @@ async function writeDateToGithub(date, pendingData) {
     `biupc counter ${date}`
   );
 
-  await updateGithubJsonWithRetry(
+  const summaryData = await updateGithubJsonWithRetry(
     summaryPath,
     () => ({ month: monthKey, days: {} }),
     summary => {
@@ -453,6 +455,75 @@ async function writeDateToGithub(date, pendingData) {
   );
 
   statsCache.delete(date);
+  return {
+    date,
+    month: monthKey,
+    counterPath,
+    summaryPath,
+    updatedAt: nowIso(),
+    summary: summarizeCounter(counterData),
+    monthUpdatedAt: summaryData.updatedAt || nowIso(),
+  };
+}
+
+function normalizeLatestIndexEntry(entry) {
+  const summary = entry.summary || {};
+  return {
+    date: entry.date,
+    month: entry.month || monthInfo(entry.date).monthKey,
+    counterPath: entry.counterPath,
+    summaryPath: entry.summaryPath,
+    updatedAt: entry.updatedAt || summary.updatedAt || nowIso(),
+    activeUsers: count(summary.activeUsers, 0),
+    activeDevices: count(summary.activeDevices, 0),
+    danmuSent: count(summary.danmuSent, 0),
+    discussionSent: count(summary.discussionSent, 0),
+    danmuFailed: count(summary.danmuFailed, 0),
+    discussionFailed: count(summary.discussionFailed, 0),
+    danmuSkipped: count(summary.danmuSkipped, 0),
+    lastSeenAt: summary.lastSeenAt || '',
+  };
+}
+
+async function writeLatestIndexToGithub(entries) {
+  const validEntries = (entries || []).filter(entry => entry && isDayKey(entry.date) && entry.counterPath && entry.summaryPath);
+  if (!validEntries.length) return null;
+
+  return updateGithubJsonWithRetry(
+    LATEST_INDEX_PATH,
+    () => ({
+      version: 1,
+      updatedAt: '',
+      latestDate: '',
+      latestMonth: '',
+      latestCounterPath: '',
+      latestSummaryPath: '',
+      days: [],
+    }),
+    index => {
+      const merged = new Map();
+      for (const item of Array.isArray(index.days) ? index.days : []) {
+        if (item && isDayKey(item.date)) merged.set(item.date, item);
+      }
+      for (const entry of validEntries) merged.set(entry.date, normalizeLatestIndexEntry(entry));
+
+      const days = [...merged.values()]
+        .filter(item => item && isDayKey(item.date))
+        .sort((a, b) => compareDayKey(b.date, a.date))
+        .slice(0, Math.max(1, LATEST_INDEX_MAX_DAYS));
+      const latest = days[0] || {};
+
+      index.version = 1;
+      index.updatedAt = nowIso();
+      index.latestDate = latest.date || '';
+      index.latestMonth = latest.month || '';
+      index.latestCounterPath = latest.counterPath || '';
+      index.latestSummaryPath = latest.summaryPath || '';
+      index.days = days;
+      return index;
+    },
+    'biupc latest index'
+  );
 }
 
 function scheduleFlush(delayMs = GITHUB_FLUSH_INTERVAL_MS) {
@@ -480,12 +551,15 @@ async function flushPendingToGithub(force = false) {
 
   flushInProgress = true;
   const dates = [...pendingCounters.keys()].sort().slice(0, MAX_DATES_PER_FLUSH);
+  const latestEntries = [];
   try {
     for (const date of dates) {
       const pendingData = cloneJson(pendingCounters.get(date));
-      await writeDateToGithub(date, pendingData);
+      const entry = await writeDateToGithub(date, pendingData);
+      latestEntries.push(entry);
       pendingCounters.delete(date);
     }
+    if (latestEntries.length) await writeLatestIndexToGithub(latestEntries);
     lastGithubFlushAt = Date.now();
     lastGithubSavedAt = nowIso();
     lastGithubStatus = 'saved';
@@ -596,6 +670,8 @@ app.get('/health', (req, res) => {
     githubCooldownUntil: githubInCooldown() ? new Date(githubCooldownUntil).toISOString() : '',
     lastGithubError,
     flushIntervalMs: GITHUB_FLUSH_INTERVAL_MS,
+    latestIndexPath: LATEST_INDEX_PATH,
+    latestIndexMaxDays: LATEST_INDEX_MAX_DAYS,
   });
 });
 
