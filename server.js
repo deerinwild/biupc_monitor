@@ -23,9 +23,10 @@ const MAX_EVENTS = Number(process.env.MAX_EVENTS || 5000);
 const GITHUB_FLUSH_INTERVAL_MS = Number(process.env.GITHUB_FLUSH_INTERVAL_MS || 5 * 60 * 1000);
 const GITHUB_RATE_LIMIT_COOLDOWN_MS = Number(process.env.GITHUB_RATE_LIMIT_COOLDOWN_MS || 20 * 60 * 1000);
 const GITHUB_ERROR_COOLDOWN_MS = Number(process.env.GITHUB_ERROR_COOLDOWN_MS || 2 * 60 * 1000);
-const MAX_DATES_PER_FLUSH = Number(process.env.MAX_DATES_PER_FLUSH || 3);
+const MAX_DATES_PER_FLUSH = Number(process.env.MAX_DATES_PER_FLUSH || 20);
+const FLUSH_ALL_MAX_DATES = Number(process.env.FLUSH_ALL_MAX_DATES || 200);
 const STATS_CACHE_MS = Number(process.env.STATS_CACHE_MS || 60 * 1000);
-const GITHUB_WRITE_RETRY = Number(process.env.GITHUB_WRITE_RETRY || 3);
+const GITHUB_WRITE_RETRY = Number(process.env.GITHUB_WRITE_RETRY || 6);
 const LATEST_INDEX_PATH = process.env.LATEST_INDEX_PATH || 'latest.json';
 const LATEST_INDEX_MAX_DAYS = Number(process.env.LATEST_INDEX_MAX_DAYS || 60);
 const SERVER_TIMEZONE = 'Asia/Shanghai';
@@ -536,7 +537,18 @@ function scheduleFlush(delayMs = GITHUB_FLUSH_INTERVAL_MS) {
   }, delay);
 }
 
-async function flushPendingToGithub(force = false) {
+function selectFlushDates(limit = MAX_DATES_PER_FLUSH) {
+  const dates = [...pendingCounters.keys()].filter(isDayKey);
+  if (!dates.length) return [];
+
+  // 优先写最近日期，避免大量历史补报把今天数据长期压住。
+  return dates
+    .sort((a, b) => compareDayKey(b, a))
+    .slice(0, Math.max(1, Number(limit) || MAX_DATES_PER_FLUSH));
+}
+
+async function flushPendingToGithub(force = false, options = {}) {
+  const maxDates = Math.max(1, Number(options.maxDates || MAX_DATES_PER_FLUSH));
   if (!githubEnabled()) return { ok: false, reason: 'github_disabled' };
   if (flushInProgress) return { ok: false, reason: 'flush_in_progress' };
   if (githubInCooldown()) {
@@ -550,7 +562,7 @@ async function flushPendingToGithub(force = false) {
   }
 
   flushInProgress = true;
-  const dates = [...pendingCounters.keys()].sort().slice(0, MAX_DATES_PER_FLUSH);
+  const dates = selectFlushDates(maxDates);
   const latestEntries = [];
   try {
     for (const date of dates) {
@@ -670,6 +682,9 @@ app.get('/health', (req, res) => {
     githubCooldownUntil: githubInCooldown() ? new Date(githubCooldownUntil).toISOString() : '',
     lastGithubError,
     flushIntervalMs: GITHUB_FLUSH_INTERVAL_MS,
+    maxDatesPerFlush: MAX_DATES_PER_FLUSH,
+    flushAllMaxDates: FLUSH_ALL_MAX_DATES,
+    githubWriteRetry: GITHUB_WRITE_RETRY,
     latestIndexPath: LATEST_INDEX_PATH,
     latestIndexMaxDays: LATEST_INDEX_MAX_DAYS,
   });
@@ -703,7 +718,14 @@ app.post('/api/ping', async (req, res) => {
 });
 
 app.post('/api/flush', requireAdmin, async (req, res) => {
-  const result = await flushPendingToGithub(true);
+  const maxDates = Number(req.query.maxDates || MAX_DATES_PER_FLUSH);
+  const result = await flushPendingToGithub(true, { maxDates });
+  res.json({ ok: result.ok !== false, result, pendingDates: pendingCounters.size, lastGithubStatus, lastGithubError });
+});
+
+app.post('/api/flush-all', requireAdmin, async (req, res) => {
+  const maxDates = Number(req.query.maxDates || FLUSH_ALL_MAX_DATES);
+  const result = await flushPendingToGithub(true, { maxDates });
   res.json({ ok: result.ok !== false, result, pendingDates: pendingCounters.size, lastGithubStatus, lastGithubError });
 });
 
